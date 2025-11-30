@@ -603,6 +603,17 @@ public class MainActivity extends AppCompatActivity {
 
         updateDockingHoursText();
         findViewById(R.id.changeDockingHoursButton).setOnClickListener(v -> showDockingHoursPopup());
+
+        MaterialButton debugClearPrefsButton;
+        debugClearPrefsButton = findViewById(R.id.debugClearPrefsButton);
+        debugClearPrefsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                SharedPreferences prefs = getSharedPreferences("app_state", MODE_PRIVATE);
+                prefs.edit().clear().apply();
+                Toast.makeText(MainActivity.this, "App data cleared!", Toast.LENGTH_SHORT).show();
+            }
+        });
     }
 
     // Restore on app start/reopen
