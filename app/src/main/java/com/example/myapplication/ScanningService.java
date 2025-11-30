@@ -1,5 +1,4 @@
 package com.example.myapplication;
-
 import android.Manifest;
 import android.app.*;
 import android.bluetooth.BluetoothAdapter;
@@ -26,10 +25,18 @@ public class ScanningService extends Service {
     public static final String ACTION_SLEEP_TIMER_UPDATE = "com.example.myapplication.ACTION_SLEEP_TIMER_UPDATE";
     public static final String ACTION_STATUS_UPDATE = "com.example.myapplication.ACTION_STATUS_UPDATE";
     public static final String EXTRA_RESET_PROTOCOL = "com.example.myapplication.EXTRA_RESET_PROTOCOL";
-
     private BluetoothAdapter bluetoothAdapter;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ArrayList<String> foundDevices = new ArrayList<>();
+    // Persistent: MAC address -> last seen timestamp (all-time)
+    private final java.util.HashMap<String, Long> allTimeLastSeen = new java.util.HashMap<>();
+    // Persistent: MAC address -> device name (all-time)
+    private final java.util.HashMap<String, String> allTimeDeviceNames = new java.util.HashMap<>();
+    // Per-scan: MAC address -> last seen timestamp (this scan only)
+    private final java.util.HashMap<String, Long> scanDevices = new java.util.HashMap<>();
+    // Per-scan: MAC address -> device name (this scan only)
+    private final java.util.HashMap<String, String> scanDeviceNames = new java.util.HashMap<>();
+    // Per-scan: set of unique Shimmers found in this scan
+    private final java.util.HashSet<String> currentScanShimmers = new java.util.HashSet<>();
 
     // Extended search flag and elapsed time tracker.
     private long extendedSearchElapsed = 0;
@@ -40,7 +47,7 @@ public class ScanningService extends Service {
     private static final long SCAN_DURATION_MS = 90 * 1000;                  // 1.5 min scan (aggressive)
     private static final long SCAN_INTERVAL_MS = 10 * 1000;                  // 10 sec break between scans
     private static final long EXTENDED_SEARCH_TOTAL_MS = 60 * 60 * 1000;     // total extended search period = 1 hour
-    private static final long SLEEP_30_MIN_MS = 30 * 60 * 1000;              // sleep 30 minutes if ≥2 devices found
+    private static final long SLEEP_30_MIN_MS = 3 * 60 * 1000;              // 30 * 60 * 1000;  sleep 30 minutes if ≥2 devices found
     private static final long SLEEP_20_MIN_MS = 20 * 60 * 1000;              // sleep 20 minutes if <2 devices found after 1 hour
 
     private long scanStartTime = 0;
@@ -70,10 +77,11 @@ public class ScanningService extends Service {
             Log.d(TAG, "Broadcasting scan timer: " + Math.max(remaining, 0) + " ms");
             sendBroadcast(intent);
 
-            if (remaining > 0) {
+            if (remaining > 0 && currentScanShimmers.size() < 2) {
                 timerHandler.postDelayed(this, 1000);
             } else {
-                Log.d(TAG, "Scan duration ended. Final broadcast sent.");
+                Log.d(TAG, "Scan duration ended or two devices found. Final broadcast sent.");
+                onScanFinished();
             }
         }
     };
@@ -145,7 +153,8 @@ public class ScanningService extends Service {
                     // Not sleeping: stop timers and clear list; do not schedule retries
                     timerHandler.removeCallbacksAndMessages(null);
                     handler.removeCallbacksAndMessages(null);
-                    foundDevices.clear();
+                    // foundDevices.clear();
+                    currentScanShimmers.clear(); // Track unique Shimmers found in this scan
                     broadcastEmptyScanResults();
                     updateNotification("Bluetooth is off. Waiting for it to turn on...");
                     sendStatusUpdate("Bluetooth is off. Waiting for it to turn on...");
@@ -181,7 +190,7 @@ public class ScanningService extends Service {
         // startService(new Intent(this, ScanningService.class));
 
         // Clear any stale device list in UI at service start
-        foundDevices.clear();
+        // (No need to clear foundDevices; it has been replaced by allTimeLastSeen/scanDevices)
         broadcastEmptyScanResults();
 
         // If we were sleeping before process restart, resume sleeping and do NOT start scanning
@@ -308,7 +317,7 @@ public class ScanningService extends Service {
                 handler.postDelayed(() -> enableBluetoothIfNeeded(ScanningService.this::startDiscovery), 15_000);
                 return;
             }
-            onScanFinished();
+            // Do NOT call onScanFinished here; let the timer control it
         } else if (BluetoothDevice.ACTION_FOUND.equals(action)) {
             BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
             if (device != null)
@@ -324,37 +333,54 @@ public class ScanningService extends Service {
         }
         String name = device.getName();
         if (name != null && name.startsWith("Shimmer")) {
-            String deviceInfo = name + " - " + device.getAddress();
-            if (!foundDevices.contains(deviceInfo)) {
-                foundDevices.add(deviceInfo);
-                Log.d(TAG, "Found device: " + deviceInfo);
-                sendStatusUpdate("Device found: " + deviceInfo);
+            String mac = device.getAddress();
+            long now = System.currentTimeMillis();
+            // Always update all-time last seen and name
+            allTimeLastSeen.put(mac, now);
+            allTimeDeviceNames.put(mac, name);
+            // Update per-scan device lists
+            scanDevices.put(mac, now);
+            scanDeviceNames.put(mac, name);
+            boolean isNewInThisScan = currentScanShimmers.add(mac);
+            Log.d(TAG, "Found device: " + name + " - " + mac + " @ " + now);
+            sendStatusUpdate("Device found: " + name + " - " + mac);
 
-                // Persist current list so UI can restore on reopen
-                persistDevices(foundDevices);
+            if (isNewInThisScan) {
+                // Build device info list for broadcast: "Name - MAC (Last seen: HH:mm:ss)" (this scan only)
+                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm:ss");
+                java.util.ArrayList<String> deviceInfoList = new java.util.ArrayList<>();
+                for (String m : scanDevices.keySet()) {
+                    long ts = scanDevices.get(m);
+                    String devName = scanDeviceNames.get(m);
+                    if (devName == null) devName = "Shimmer";
+                    String info = devName + " - " + m + " (Last seen: " + sdf.format(new java.util.Date(ts)) + ")";
+                    deviceInfoList.add(info);
+                }
+
+                // Persist current scan list so UI can restore on reopen
+                persistDevices(deviceInfoList);
 
                 // Immediately update the UI list so user can select without waiting
                 Intent listIntent = new Intent(ACTION_SCAN_RESULTS);
-                listIntent.putStringArrayListExtra("devices", foundDevices);
+                listIntent.putStringArrayListExtra("devices", deviceInfoList);
                 listIntent.setPackage(getApplicationContext().getPackageName());
                 sendBroadcast(listIntent);
+            }
 
-                // Only stop scanning after two unique Shimmer devices are found
-                if (foundDevices.size() >= 2) {
-                    if (bluetoothAdapter.isDiscovering()) {
-                        bluetoothAdapter.cancelDiscovery();
-                        Log.d(TAG, "Bluetooth discovery cancelled after two Shimmer devices found.");
-                    }
-                    // Stop the scanning timer immediately.
-                    timerHandler.removeCallbacksAndMessages(null);
-                    // Broadcast device info via ACTION_TIMER_UPDATE.
-                    Intent infoIntent = new Intent(ACTION_TIMER_UPDATE);
-                    infoIntent.putExtra("device_info", deviceInfo);
-                    infoIntent.setPackage(getApplicationContext().getPackageName());
-                    sendBroadcast(infoIntent);
-                    // Proceed to finish the scan process.
-                    onScanFinished();
+            // Only stop scanning after two unique Shimmer devices are found in THIS scan
+            if (currentScanShimmers.size() >= 2) {
+                if (bluetoothAdapter.isDiscovering()) {
+                    bluetoothAdapter.cancelDiscovery();
+                    Log.d(TAG, "Bluetooth discovery cancelled after two Shimmer devices found in current scan.");
                 }
+                // Broadcast device info via ACTION_TIMER_UPDATE.
+                Intent infoIntent = new Intent(ACTION_TIMER_UPDATE);
+                infoIntent.putExtra("device_info", name + " - " + mac);
+                infoIntent.setPackage(getApplicationContext().getPackageName());
+                sendBroadcast(infoIntent);
+                // Stop the scan timer and finish scan immediately
+                timerHandler.removeCallbacksAndMessages(null);
+                onScanFinished();
             }
         }
     }
@@ -369,50 +395,60 @@ public class ScanningService extends Service {
         isScanning = false; // mark scan as ended
 
         timerHandler.removeCallbacksAndMessages(null);
-        int count = foundDevices.size();
+        int count = scanDevices.size();
         Log.d(TAG, "Scan finished. Devices found: " + count);
         updateNotification("Scan finished. " + count + " device(s) found");
         sendStatusUpdate("Scan finished. " + count + " device(s) found");
 
-        // Broadcast scan results.
+        // Always build device info list from allTimeLastSeen/allTimeDeviceNames
+        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm:ss");
+        java.util.ArrayList<String> deviceInfoList = new java.util.ArrayList<>();
+        for (String m : allTimeLastSeen.keySet()) {
+            long ts = allTimeLastSeen.get(m);
+            String devName = allTimeDeviceNames.get(m);
+            if (devName == null) devName = "Shimmer";
+            String info = devName + " - " + m + " (Last seen: " + sdf.format(new java.util.Date(ts)) + ")";
+            deviceInfoList.add(info);
+        }
+        // Broadcast all-time device list to UI
         Intent updateIntent = new Intent(ACTION_SCAN_RESULTS);
-        updateIntent.putStringArrayListExtra("devices", foundDevices);
+        updateIntent.putStringArrayListExtra("devices", deviceInfoList);
         updateIntent.setPackage(getApplicationContext().getPackageName());
         sendBroadcast(updateIntent);
-        // Persist final list
-        persistDevices(foundDevices);
+        // Persist all-time device list
+        persistDevices(deviceInfoList);
 
         // Adaptive logic:
         if (!isExtendedSearch) {  // Initial scan branch.
-                if (count < 2) {
-                    Log.d(TAG, "Less than 2 devices found in initial scan. Starting extended search.");
-                    startExtendedSearch();
-                } else {
-                    Log.d(TAG, "2 or more devices found in initial scan. Sleeping for 30 minutes.");
-                    sleepThenRestart(SLEEP_30_MIN_MS);
-                }
+            if (count < 2) {
+                Log.d(TAG, "Less than 2 devices found in initial scan. Starting extended search.");
+                startExtendedSearch();
+            } else {
+                Log.d(TAG, "2 or more devices found in initial scan. Sleeping for 30 minutes.");
+                sleepThenRestart(SLEEP_30_MIN_MS);
+            }
         } else {  // Extended Search branch.
-                if (count >= 2) {
-                    Log.d(TAG, "2 or more devices found during extended search. Sleeping for 30 minutes.");
-                    sleepThenRestart(SLEEP_30_MIN_MS);
+            if (count >= 2) {
+                Log.d(TAG, "2 or more devices found during extended search. Sleeping for 30 minutes.");
+                sleepThenRestart(SLEEP_30_MIN_MS);
+            } else {
+                extendedSearchElapsed += SCAN_INTERVAL_MS;
+                if (extendedSearchElapsed >= EXTENDED_SEARCH_TOTAL_MS) {
+                    Log.d(TAG, "Extended search reached max duration (1 hour). Sleeping for 20 minutes and resetting to initial scan.");
+                    isExtendedSearch = false;
+                    sleepThenRestart(SLEEP_20_MIN_MS);
                 } else {
-                    extendedSearchElapsed += SCAN_INTERVAL_MS;
-                    if (extendedSearchElapsed >= EXTENDED_SEARCH_TOTAL_MS) {
-                        Log.d(TAG, "Extended search reached max duration (1 hour). Sleeping for 20 minutes and resetting to initial scan.");
-                        isExtendedSearch = false;
-                        sleepThenRestart(SLEEP_20_MIN_MS);
-                    } else {
-                        Log.d(TAG, "Extended search ongoing. Scheduling next scan after 20 seconds.");
-                        scheduleNextScan();
-                    }
+                    Log.d(TAG, "Extended search ongoing. Scheduling next scan after 20 seconds.");
+                    scheduleNextScan();
                 }
+            }
         }
     }
 
     // Schedule the next scan after a 20-second interval.
     private void scheduleNextScan() {
-        updateNotification("Waiting 20 seconds before next scan");
-        sendStatusUpdate("Waiting 20 seconds before next scan");
+        updateNotification("Waiting " + (SCAN_INTERVAL_MS / 1000) + " seconds before next scan");
+        sendStatusUpdate("Waiting " + (SCAN_INTERVAL_MS / 1000) + " seconds before next scan");
         Log.d(TAG, "Scheduling next scan in " + (SCAN_INTERVAL_MS / 1000) + " seconds");
         handler.postDelayed(() -> {
             // Double-check that the service is still active.
@@ -482,7 +518,7 @@ public class ScanningService extends Service {
         extendedSearchElapsed = 0;
         isSleeping = false; // defensively clear sleeping
         hasEverStartedScan = true; // mark that we initiated scanning
-        foundDevices.clear();
+        // foundDevices.clear(); // Do not clear device list at start
         updateNotification("Starting initial scan");
         sendStatusUpdate("Starting initial scan");
         enableBluetoothIfNeeded(ScanningService.this::startDiscovery);
@@ -494,7 +530,7 @@ public class ScanningService extends Service {
         isExtendedSearch = true;
         extendedSearchElapsed = 0;
         isSleeping = false; // ensure not sleeping in extended search
-        foundDevices.clear();
+        // foundDevices.clear(); // Do not clear device list at start
         updateNotification("Starting extended search");
         sendStatusUpdate("Starting extended search");
         scheduleNextScan();
@@ -518,7 +554,10 @@ public class ScanningService extends Service {
         }
         // Reset state for a fresh scan cycle so results broadcast correctly
         scanFinishedHandled = false;
-        foundDevices.clear();
+        // Clear per-scan device lists at the start of every scan
+        scanDevices.clear();
+        scanDeviceNames.clear();
+        currentScanShimmers.clear(); // Track unique Shimmers found in this scan
         bluetoothAdapter.startDiscovery();
         isScanning = true;
         Log.d(TAG, "Bluetooth discovery started");
