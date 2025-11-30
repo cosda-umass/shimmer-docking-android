@@ -1,4 +1,3 @@
-
 <FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -70,6 +69,20 @@
                     android:padding="0dp"
                     app:cornerRadius="28dp"
                     android:onClick="onMapButtonClick" />
+
+                <!-- Debug: Clear SharedPreferences button -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/debugClearPrefsButton"
+                    style="@style/Widget.Material3.Button.Icon"
+                    android:layout_width="56dp"
+                    android:layout_height="56dp"
+                    android:text="🐞"
+                    android:textSize="24sp"
+                    android:contentDescription="Debug: Clear app data"
+                    android:backgroundTint="?attr/colorSurface"
+                    android:elevation="6dp"
+                    android:padding="0dp"
+                    app:cornerRadius="28dp" />
             </LinearLayout>
 
             <View
