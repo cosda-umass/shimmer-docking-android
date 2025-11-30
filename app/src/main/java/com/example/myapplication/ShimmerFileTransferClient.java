@@ -341,6 +341,26 @@ public class ShimmerFileTransferClient {
 
                             if (packetId != (CHUNK_DATA_PACKET & 0xFF)) {
                                 Log.w(TAG, "Unexpected header packet received: " + String.format("%02X", packetId));
+                                // Try to read and log all available bytes (up to 32) for debugging
+                                try {
+                                    int available = in.available();
+                                    if (available > 0) {
+                                        int toRead = Math.min(available, 32);
+                                        byte[] debugBytes = new byte[toRead];
+                                        int bytesRead = in.read(debugBytes);
+                                        if (bytesRead > 0) {
+                                            StringBuilder debugData = new StringBuilder("Next available bytes after unexpected header: ");
+                                            for (int j = 0; j < bytesRead; j++) {
+                                                debugData.append(String.format("%02X ", debugBytes[j]));
+                                            }
+                                            Log.w("DockingTransferError", debugData.toString().trim());
+                                        }
+                                    } else {
+                                        Log.w("DockingTransferError", "No additional bytes available after unexpected header.");
+                                    }
+                                } catch (Exception e) {
+                                    Log.e("DockingTransferError", "Error reading bytes after unexpected header: " + e.getMessage(), e);
+                                }
                                 // Delete incomplete file and DB entry
                                 if (outputFile.exists()) outputFile.delete();
                                 FileMetaDatabaseHelper dbHelper = new FileMetaDatabaseHelper(context);
