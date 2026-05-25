@@ -381,15 +381,22 @@ public class MainActivity extends AppCompatActivity {
 
          if (dpm != null) {
              if (dpm.isAdminActive(adminName)) {
-                 // Admin is active, safe to set lock task packages
-                 dpm.setLockTaskPackages(adminName, new String[]{getPackageName()});
+                 try {
+                     dpm.setLockTaskPackages(adminName, new String[]{getPackageName()});
+                     dpm.setLockTaskFeatures(adminName,
+                             DevicePolicyManager.LOCK_TASK_FEATURE_HOME |
+                                     DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS |
+                                     DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO);
+                 } catch (SecurityException se) {
+                     // Android 14+ can reject this unless app is proper device/profile owner.
+                     Log.w("MainActivity", "Lock task policy update not permitted on this device", se);
+                 }
 
-                 dpm.setLockTaskFeatures(adminName,
-                         DevicePolicyManager.LOCK_TASK_FEATURE_HOME |
-                                 DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS |
-                                 DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO );
-
-                 startLockTask();
+                 try {
+                     startLockTask();
+                 } catch (IllegalArgumentException | IllegalStateException | SecurityException e) {
+                     Log.w("MainActivity", "startLockTask() not allowed in current state", e);
+                 }
              } else {
                  // Admin not active: prompt user to activate it
                  Intent intent = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);

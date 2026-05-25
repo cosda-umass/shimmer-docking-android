@@ -27,6 +27,7 @@ public class ScanningService extends Service {
     public static final String EXTRA_RESET_PROTOCOL = "com.example.myapplication.EXTRA_RESET_PROTOCOL";
     private BluetoothAdapter bluetoothAdapter;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private PowerManager.WakeLock wakeLock;
     // Persistent: MAC address -> last seen timestamp (all-time)
     private final java.util.HashMap<String, Long> allTimeLastSeen = new java.util.HashMap<>();
     // Persistent: MAC address -> device name (all-time)
@@ -187,6 +188,15 @@ public class ScanningService extends Service {
         registerReceiver(btStateReceiver, new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED));
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("Service started"));
+        
+        // Acquire WakeLock to keep CPU awake during scanning operations
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ScanningService::WakeLock");
+            wakeLock.acquire();
+            Log.d(TAG, "WakeLock acquired");
+        }
+        
         // startService(new Intent(this, ScanningService.class));
 
         // Clear any stale device list in UI at service start
@@ -714,6 +724,13 @@ public class ScanningService extends Service {
         if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
             bluetoothAdapter.cancelDiscovery();
         }
+        
+        // Release WakeLock
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+            Log.d(TAG, "WakeLock released");
+        }
+        
         //clearScanStatusState();
         super.onDestroy();
     }

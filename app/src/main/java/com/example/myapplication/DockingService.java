@@ -14,6 +14,7 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
@@ -58,6 +59,7 @@ public class DockingService extends Service implements DockingManager.DockingCal
 
     private DockingManager dockingManager;
     private Handler handler = new Handler();
+    private PowerManager.WakeLock wakeLock;
 
     private final Runnable retryRunnable = new Runnable() {
         @Override
@@ -130,6 +132,14 @@ public class DockingService extends Service implements DockingManager.DockingCal
         createNotificationChannel();
         startForeground(NOTIF_ID, buildNotification("Docking protocol running..."));
 
+        // Acquire WakeLock to keep CPU awake during docking protocol
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DockingService::WakeLock");
+            wakeLock.acquire();
+            Log.d("DockingService", "WakeLock acquired");
+        }
+
         // Load latest window hours
         SharedPreferences prefs = getSharedPreferences("docking_prefs", MODE_PRIVATE);
         int startHour = prefs.getInt("night_start_hour", 20);
@@ -167,6 +177,13 @@ public class DockingService extends Service implements DockingManager.DockingCal
         super.onDestroy();
         handler.removeCallbacksAndMessages(null);
         cancelRetry();
+        
+        // Release WakeLock
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+            Log.d("DockingService", "WakeLock released");
+        }
+        
         try { unregisterReceiver(transferDoneReceiver); } catch (Exception ignored) {}
         try { unregisterReceiver(transferFailedReceiver); } catch (Exception ignored) {}
         try { unregisterReceiver(btStateReceiver); } catch (Exception ignored) {}

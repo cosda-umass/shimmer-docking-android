@@ -11,6 +11,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.location.LocationManager;
 import android.os.Handler;
+import android.os.PowerManager;
 import android.util.Log;
 
 import androidx.core.app.ActivityCompat;
@@ -42,6 +43,7 @@ public class DockingManager {
     private static final String TAG = "DockingManager";
     private final Context context;
     private final Handler handler = new Handler();
+    private PowerManager.WakeLock wakeLock;
     private final BluetoothAdapter adapter;
     private DockingCallback callback;
 
@@ -115,6 +117,13 @@ public class DockingManager {
         this.context = ctx;
         this.callback = cb;
         this.adapter = BluetoothAdapter.getDefaultAdapter();
+        
+        // Initialize WakeLock for critical operations
+        PowerManager powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DockingManager::WakeLock");
+        }
+        
         Log.d(TAG, "DockingManager constructed");
     }
 
@@ -549,7 +558,21 @@ private void processShimmerQueue() {
             // Stop discovery if active and wait briefly before opening RFCOMM for transfer
 //            try { if (adapter != null && adapter.isDiscovering()) adapter.cancelDiscovery(); } catch (Exception ignored) {}
             Log.d(TAG, "Waiting " + waitBeforeTransferDuration + "ms before starting file transfer...");
-            handler.postDelayed(this::startFileTransfer, waitBeforeTransferDuration);
+            
+            // Acquire WakeLock before critical delay
+            if (wakeLock != null && !wakeLock.isHeld()) {
+                wakeLock.acquire();
+                Log.d(TAG, "WakeLock acquired before transfer delay");
+            }
+            
+            handler.postDelayed(() -> {
+                // Release WakeLock after transfer starts
+                if (wakeLock != null && wakeLock.isHeld()) {
+                    wakeLock.release();
+                    Log.d(TAG, "WakeLock released after transfer started");
+                }
+                startFileTransfer();
+            }, waitBeforeTransferDuration);
         }
     }
 
@@ -897,7 +920,21 @@ private void processShimmerQueue() {
             callback.onFileTransferStart();
             // Stop discovery if active and wait briefly before opening RFCOMM for transfer
             Log.d(TAG, "Waiting " + waitBeforeTransferDuration + "ms before starting file transfer (round robin)...");
-            handler.postDelayed(() -> startFileTransferRoundRobin(mac, onComplete), waitBeforeTransferDuration);
+            
+            // Acquire WakeLock before critical delay
+            if (wakeLock != null && !wakeLock.isHeld()) {
+                wakeLock.acquire();
+                Log.d(TAG, "WakeLock acquired before transfer delay (round robin)");
+            }
+            
+            handler.postDelayed(() -> {
+                // Release WakeLock after transfer starts
+                if (wakeLock != null && wakeLock.isHeld()) {
+                    wakeLock.release();
+                    Log.d(TAG, "WakeLock released after transfer started (round robin)");
+                }
+                startFileTransferRoundRobin(mac, onComplete);
+            }, waitBeforeTransferDuration);
         }
     }
 
@@ -1022,6 +1059,12 @@ private void processShimmerQueue() {
 
         // Cancel all pending handler callbacks
         handler.removeCallbacksAndMessages(null);
+        
+        // Release WakeLock if held
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+            Log.d(TAG, "WakeLock released in forceStopProtocol");
+        }
 
         // Unregister device and transfer receivers
         safeUnregisterDeviceReceiver();
