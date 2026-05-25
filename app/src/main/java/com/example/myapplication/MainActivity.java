@@ -421,6 +421,7 @@ public class MainActivity extends AppCompatActivity {
         timerText = findViewById(R.id.timerText);
         statusText = findViewById(R.id.statusText);
         deviceListView = findViewById(R.id.deviceListView);
+        MaterialButton clearDevicesButton = findViewById(R.id.clearDevicesButton);
         progressText = findViewById(R.id.progressText);
         transferProgressBar = findViewById(R.id.transferProgressBar);
 
@@ -429,6 +430,13 @@ public class MainActivity extends AppCompatActivity {
 
         progressSection.setVisibility(View.GONE);
         filesToSyncSection.setVisibility(View.GONE);
+
+        clearDevicesButton.setOnClickListener(v -> {
+            Log.d("MainActivity", "Clear Available Devices clicked; clearing displayed list text");
+            ArrayList<String> empty = new ArrayList<>();
+            updateDeviceList(empty);
+            persistDeviceListCompat(empty);
+        });
 
         transferButton = findViewById(R.id.transferButton);
         transferButton.setOnClickListener(v -> {

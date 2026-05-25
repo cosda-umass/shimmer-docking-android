@@ -357,7 +357,7 @@ public class ScanningService extends Service {
 
             if (isNewInThisScan) {
                 // Build device info list for broadcast: "Name - MAC (Last seen: HH:mm:ss)" (this scan only)
-                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm:ss");
+                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault());
                 java.util.ArrayList<String> deviceInfoList = new java.util.ArrayList<>();
                 for (String m : scanDevices.keySet()) {
                     long ts = scanDevices.get(m);
@@ -411,7 +411,7 @@ public class ScanningService extends Service {
         sendStatusUpdate("Scan finished. " + count + " device(s) found");
 
         // Always build device info list from allTimeLastSeen/allTimeDeviceNames
-        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm:ss");
+        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault());
         java.util.ArrayList<String> deviceInfoList = new java.util.ArrayList<>();
         for (String m : allTimeLastSeen.keySet()) {
             long ts = allTimeLastSeen.get(m);
