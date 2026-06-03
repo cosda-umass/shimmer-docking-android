@@ -671,7 +671,7 @@ public class ShimmerFileTransferClient {
 
             RequestBody body = RequestBody.create(filenames.toString(), MediaType.parse("application/json"));
             Request request = new Request.Builder()
-                    .url("https://odb777ddnc.execute-api.us-east-2.amazonaws.com/missing-files/")
+                    .url("https://5cp7icawy1.execute-api.us-east-2.amazonaws.com/missing-files/")
                     .post(body)
                     .build();
 
@@ -702,7 +702,7 @@ public class ShimmerFileTransferClient {
             body.put("full_file_name", fileName);
             RequestBody reqBody = RequestBody.create(body.toString(), MediaType.parse("application/json"));
             Request request = new Request.Builder()
-                    .url("https://odb777ddnc.execute-api.us-east-2.amazonaws.com/decode-and-store/")
+                    .url("https://5cp7icawy1.execute-api.us-east-2.amazonaws.com/decode-and-store/")
                     .post(reqBody)
                     .build();
             try (Response response = client.newCall(request).execute()) {
@@ -724,7 +724,7 @@ public class ShimmerFileTransferClient {
         OkHttpClient client = new OkHttpClient();
         try {
             Request getUrlRequest = new Request.Builder()
-                    .url("https://odb777ddnc.execute-api.us-east-2.amazonaws.com/generate-upload-url/?filename=" + file.getName())
+                    .url("https://5cp7icawy1.execute-api.us-east-2.amazonaws.com/generate-upload-url/?filename=" + file.getName())
                     .get()
                     .build();
 

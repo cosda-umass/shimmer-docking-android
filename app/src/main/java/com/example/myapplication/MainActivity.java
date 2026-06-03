@@ -1358,7 +1358,7 @@ public class MainActivity extends AppCompatActivity {
         Log.d("MapButton", "Sending GET for MAC: " + finalMac);
         new Thread(() -> {
             try {
-                String urlStr = "https://odb777ddnc.execute-api.us-east-2.amazonaws.com/ddb/device-patient-map/"
+                String urlStr = "https://5cp7icawy1.execute-api.us-east-2.amazonaws.com/ddb/device-patient-map/"
                         + URLEncoder.encode(finalMac, "UTF-8");
                 HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
                 conn.setRequestMethod("GET");
@@ -1487,7 +1487,7 @@ private void showDevicePatientMapDialog(String mac, String existingName, boolean
 private void getMapping(String mac, EditText patientInput, EditText shimmer1Input, EditText shimmer2Input, TextView updatedAtView, boolean readOnly) {
     new Thread(() -> {
         try {
-            String urlStr = "https://odb777ddnc.execute-api.us-east-2.amazonaws.com/ddb/device-patient-map/"
+            String urlStr = "https://5cp7icawy1.execute-api.us-east-2.amazonaws.com/ddb/device-patient-map/"
                     + URLEncoder.encode(mac, "UTF-8");
             HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setRequestMethod("GET");
@@ -1532,7 +1532,7 @@ private void getMapping(String mac, EditText patientInput, EditText shimmer1Inpu
 private void putMapping(String mac, String patient, String shimmer1, String shimmer2, AlertDialog dialog) {
         new Thread(() -> {
             try {
-                String urlStr = "https://odb777ddnc.execute-api.us-east-2.amazonaws.com/ddb/device-patient-map/" + java.net.URLEncoder.encode(mac, "UTF-8");
+                String urlStr = "https://5cp7icawy1.execute-api.us-east-2.amazonaws.com/ddb/device-patient-map/" + java.net.URLEncoder.encode(mac, "UTF-8");
                 java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(urlStr).openConnection();
                 conn.setRequestMethod("PUT");
                 conn.setRequestProperty("accept", "application/json");
