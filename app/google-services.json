@@ -1,13 +1,13 @@
 {
   "project_info": {
-    "project_number": "660093241389",
-    "project_id": "shimmersensor",
-    "storage_bucket": "shimmersensor.firebasestorage.app"
+    "project_number": "894212067403",
+    "project_id": "shimmersensor-2",
+    "storage_bucket": "shimmersensor-2.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:660093241389:android:f3c27afdfc1b63f8f810a4",
+        "mobilesdk_app_id": "1:894212067403:android:77f02617a10b74ad2bbdce",
         "android_client_info": {
           "package_name": "com.example.myapplication"
         }
@@ -15,7 +15,7 @@
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyADRgSHm8s6ZpX-RfXhV4zwJsIkBE-tZPs"
+          "current_key": "AIzaSyAXSkdL9CMPGlY6A4LlMBJ4HbbibtnfQaI"
         }
       ],
       "services": {

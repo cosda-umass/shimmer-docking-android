@@ -9,9 +9,9 @@
               <option name="connection">
                 <ConnectionSetting>
                   <option name="appId" value="com.example.myapplication" />
-                  <option name="mobileSdkAppId" value="1:660093241389:android:f3c27afdfc1b63f8f810a4" />
-                  <option name="projectId" value="shimmersensor" />
-                  <option name="projectNumber" value="660093241389" />
+                  <option name="mobileSdkAppId" value="1:894212067403:android:77f02617a10b74ad2bbdce" />
+                  <option name="projectId" value="shimmersensor-2" />
+                  <option name="projectNumber" value="894212067403" />
                 </ConnectionSetting>
               </option>
               <option name="signal" value="SIGNAL_UNSPECIFIED" />
