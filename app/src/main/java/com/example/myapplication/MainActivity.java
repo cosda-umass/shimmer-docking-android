@@ -156,7 +156,6 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar transferProgressBar;
     private LinearLayout progressSection;
     private MaterialButton enableKioskButton;
-    private MaterialButton disableKioskButton;
     private com.google.android.material.card.MaterialCardView filesToSyncSection;
     private Button syncButton;
     private ListView fileListView;
@@ -623,10 +622,6 @@ public class MainActivity extends AppCompatActivity {
         enableKioskButton = findViewById(R.id.enableKioskButton);
         if (enableKioskButton != null) {
             enableKioskButton.setOnClickListener(v -> enableKioskModeFromButton());
-        }
-        disableKioskButton = findViewById(R.id.disableKioskButton);
-        if (disableKioskButton != null) {
-            disableKioskButton.setOnClickListener(v -> disableKioskModeFromButton());
         }
         updateKioskButtonVisibility();
 
@@ -1596,9 +1591,8 @@ private void putMapping(String mac, String patient, String shimmer1, String shim
     }
 
     private void updateKioskButtonVisibility() {
-        boolean locked = isKioskLockEnabled();
-        if (enableKioskButton != null) enableKioskButton.setVisibility(locked ? View.GONE : View.VISIBLE);
-        if (disableKioskButton != null) disableKioskButton.setVisibility(locked ? View.VISIBLE : View.GONE);
+        if (enableKioskButton == null) return;
+        enableKioskButton.setVisibility(isKioskLockEnabled() ? View.GONE : View.VISIBLE);
     }
 
     private void enableKioskModeFromButton() {
@@ -1615,32 +1609,6 @@ private void putMapping(String mac, String patient, String shimmer1, String shim
         startKioskIfProvisioned();
     }
 
-    private void disableKioskModeFromButton() {
-        android.widget.EditText pinInput = new android.widget.EditText(this);
-        pinInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD);
-        pinInput.setHint("Enter PIN");
-        new AlertDialog.Builder(this)
-                .setTitle("Exit Kiosk Mode")
-                .setMessage("Enter the admin PIN to exit kiosk mode.")
-                .setView(pinInput)
-                .setPositiveButton("Confirm", (d, w) -> {
-                    String pin = pinInput.getText().toString();
-                    if ("1234".equals(pin)) {
-                        try {
-                            stopLockTask();
-                        } catch (Exception e) {
-                            Log.w("MainActivity", "stopLockTask() failed", e);
-                        }
-                        setKioskLockEnabled(false);
-                        updateKioskButtonVisibility();
-                        Toast.makeText(this, "Kiosk mode disabled.", Toast.LENGTH_SHORT).show();
-                    } else {
-                        Toast.makeText(this, "Incorrect PIN", Toast.LENGTH_SHORT).show();
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
 }
 
 
