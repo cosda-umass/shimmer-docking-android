@@ -70,6 +70,35 @@
                     app:cornerRadius="28dp"
                     android:onClick="onMapButtonClick" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/enableKioskButton"
+                    style="@style/Widget.Material3.Button.Icon"
+                    android:layout_width="56dp"
+                    android:layout_height="56dp"
+                    android:contentDescription="Enable kiosk mode"
+                    android:backgroundTint="?attr/colorSurface"
+                    android:elevation="6dp"
+                    android:padding="0dp"
+                    app:icon="@android:drawable/ic_lock_lock"
+                    app:iconSize="24dp"
+                    app:iconTint="?attr/colorOnSurface"
+                    app:cornerRadius="28dp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/disableKioskButton"
+                    style="@style/Widget.Material3.Button.Icon"
+                    android:layout_width="56dp"
+                    android:layout_height="56dp"
+                    android:contentDescription="Disable kiosk mode"
+                    android:backgroundTint="?attr/colorSurface"
+                    android:elevation="6dp"
+                    android:padding="0dp"
+                    android:visibility="gone"
+                    app:icon="@android:drawable/ic_lock_idle_lock"
+                    app:iconSize="24dp"
+                    app:iconTint="?attr/colorOnSurface"
+                    app:cornerRadius="28dp" />
+
                 <!-- Debug: Clear SharedPreferences button -->
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/debugClearPrefsButton"

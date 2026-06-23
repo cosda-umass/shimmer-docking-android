@@ -63,6 +63,8 @@ import java.util.regex.Pattern;
 
 public class MainActivity extends AppCompatActivity {
     private static final int PERMISSION_REQUEST_CODE = 1001;
+    private static final String PREFS_KIOSK_SETUP = "kiosk_setup";
+    private static final String KEY_KIOSK_LOCK_ENABLED = "kiosk_lock_enabled";
     private static final String[] REQUIRED_PERMISSIONS = {
             Manifest.permission.BLUETOOTH_CONNECT,
             Manifest.permission.BLUETOOTH_SCAN,
@@ -153,6 +155,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView progressText;
     private ProgressBar transferProgressBar;
     private LinearLayout progressSection;
+    private MaterialButton enableKioskButton;
+    private MaterialButton disableKioskButton;
     private com.google.android.material.card.MaterialCardView filesToSyncSection;
     private Button syncButton;
     private ListView fileListView;
@@ -615,6 +619,16 @@ public class MainActivity extends AppCompatActivity {
         if (mapButton != null) {
             mapButton.setOnClickListener(v -> onMapDeviceButtonClicked());
         }
+
+        enableKioskButton = findViewById(R.id.enableKioskButton);
+        if (enableKioskButton != null) {
+            enableKioskButton.setOnClickListener(v -> enableKioskModeFromButton());
+        }
+        disableKioskButton = findViewById(R.id.disableKioskButton);
+        if (disableKioskButton != null) {
+            disableKioskButton.setOnClickListener(v -> disableKioskModeFromButton());
+        }
+        updateKioskButtonVisibility();
 
         updateDockingHoursText();
         findViewById(R.id.changeDockingHoursButton).setOnClickListener(v -> showDockingHoursPopup());
@@ -1245,8 +1259,8 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        // Restore last known UI state (status text, device list, selection)
         restoreUIState();
+        updateKioskButtonVisibility();
     }
 
 
@@ -1539,6 +1553,94 @@ private void putMapping(String mac, String patient, String shimmer1, String shim
     }
 
     private static final java.util.regex.Pattern MAC_PATTERN = java.util.regex.Pattern.compile("(?i)([0-9A-F]{2}:){5}[0-9A-F]{2}");
+
+    private boolean isKioskLockEnabled() {
+        return getSharedPreferences(PREFS_KIOSK_SETUP, MODE_PRIVATE)
+                .getBoolean(KEY_KIOSK_LOCK_ENABLED, false);
+    }
+
+    private void setKioskLockEnabled(boolean enabled) {
+        getSharedPreferences(PREFS_KIOSK_SETUP, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_KIOSK_LOCK_ENABLED, enabled)
+                .apply();
+    }
+
+    private void applyDeviceOwnerLockTaskPolicyIfPossible() {
+        DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+        ComponentName adminName = new ComponentName(this, ShimmerDeviceAdminReceiver.class);
+        if (dpm == null || !dpm.isAdminActive(adminName)) return;
+        try {
+            dpm.setLockTaskPackages(adminName, new String[]{getPackageName()});
+            dpm.setLockTaskFeatures(adminName,
+                    DevicePolicyManager.LOCK_TASK_FEATURE_HOME |
+                            DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS |
+                            DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO);
+        } catch (SecurityException se) {
+            Log.w("MainActivity", "Lock task policy update not permitted on this device", se);
+        }
+    }
+
+    private void startKioskIfProvisioned() {
+        if (!isKioskLockEnabled()) {
+            Log.d("MainActivity", "startKioskIfProvisioned: skipped (kiosk flag false)");
+            return;
+        }
+        Log.d("MainActivity", "startKioskIfProvisioned: kiosk flag true -> calling startLockTask()");
+        try {
+            startLockTask();
+            Log.d("MainActivity", "Kiosk lock task started");
+        } catch (IllegalArgumentException | IllegalStateException | SecurityException e) {
+            Log.w("MainActivity", "startLockTask() not allowed in current state", e);
+        }
+    }
+
+    private void updateKioskButtonVisibility() {
+        boolean locked = isKioskLockEnabled();
+        if (enableKioskButton != null) enableKioskButton.setVisibility(locked ? View.GONE : View.VISIBLE);
+        if (disableKioskButton != null) disableKioskButton.setVisibility(locked ? View.VISIBLE : View.GONE);
+    }
+
+    private void enableKioskModeFromButton() {
+        if (isKioskLockEnabled()) {
+            Toast.makeText(this, "Kiosk mode is already enabled.", Toast.LENGTH_SHORT).show();
+            startKioskIfProvisioned();
+            return;
+        }
+        setKioskLockEnabled(true);
+        updateKioskButtonVisibility();
+        Log.d("MainActivity", "Enable Kiosk clicked; persisting kiosk flag and starting lock task.");
+        Toast.makeText(this, "Kiosk mode enabled.", Toast.LENGTH_SHORT).show();
+        applyDeviceOwnerLockTaskPolicyIfPossible();
+        startKioskIfProvisioned();
+    }
+
+    private void disableKioskModeFromButton() {
+        android.widget.EditText pinInput = new android.widget.EditText(this);
+        pinInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        pinInput.setHint("Enter PIN");
+        new AlertDialog.Builder(this)
+                .setTitle("Exit Kiosk Mode")
+                .setMessage("Enter the admin PIN to exit kiosk mode.")
+                .setView(pinInput)
+                .setPositiveButton("Confirm", (d, w) -> {
+                    String pin = pinInput.getText().toString();
+                    if ("1234".equals(pin)) {
+                        try {
+                            stopLockTask();
+                        } catch (Exception e) {
+                            Log.w("MainActivity", "stopLockTask() failed", e);
+                        }
+                        setKioskLockEnabled(false);
+                        updateKioskButtonVisibility();
+                        Toast.makeText(this, "Kiosk mode disabled.", Toast.LENGTH_SHORT).show();
+                    } else {
+                        Toast.makeText(this, "Incorrect PIN", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
 }
 
 
