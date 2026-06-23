@@ -73,9 +73,26 @@ public class ShimmerFileTransferClient {
     private static final byte TRANSFER_START_PACKET    = (byte) 0xFD;
     private static final byte CHUNK_DATA_PACKET        = (byte) 0xFC;
     private static final byte TRANSFER_END_PACKET      = (byte) 0xFE;
+    private static final byte CHECK_DOCK_STATUS        = (byte) 0xD5;
+    private static final byte RESPONSE_DOCK_STATE      = (byte) 0xD6;
+    private static final byte ACK_SUCCESS              = (byte) 0x01;
+    private static final byte ACK_FAIL                 = (byte) 0x00;
+    private static final byte TRANSFER_STATUS_SUCCESS  = (byte) 0x01;
+    private static final byte FILE_TRANSFER_VERSION    = (byte) 0x01;
 
     // Configuration
     private static final int CHUNK_GROUP_SIZE = 16;
+    private static final int MAX_FILENAME_LENGTH = 64;
+    private static final int NUM_DOCK_STATUS_QUERIES = 3;
+    private static final int DEVICE_CLOCK_RATE_HZ = 32768;
+    private static final double DOCK_TIMESTAMP_TOLERANCE_S = 1.0;
+    private static final int CRC_INIT = 0xB0CA;
+    private static final int CRC_OFF = 0;
+    private static final int CRC_1BYTE_ENABLED = 1;
+    private static final int CRC_2BYTES_ENABLED = 2;
+    private static final int RX_CRC_MODE = CRC_2BYTES_ENABLED;
+    private static final int TX_CRC_MODE = CRC_OFF;
+    private static final int DATA_CHUNK_CRC_MODE = CRC_OFF;
 
     // Overloaded transfer method with timestamp
     public void transferOneFileFullFlow(String macAddress, DockingTimestampModel timestampModel) {
@@ -155,24 +172,32 @@ public class ShimmerFileTransferClient {
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
 
-            // --- STEP 2: Request File Count ---
-            out.write(new byte[]{LIST_FILES_COMMAND});
-            out.flush();
-            Log.d(TAG, "Sent LIST_FILES_COMMAND (D0)");
-            crashlytics.log("Sent LIST_FILES_COMMAND (D0)");
-
-            int responseId = in.read();
-            while (responseId == 0xFF) {
-                responseId = in.read();
-            }
-            if (responseId != (FILE_LIST_RESPONSE & 0xFF)) {
-                Log.e(TAG, "Expected FILE_LIST_RESPONSE (D3) but got: " + String.format("%02X", responseId));
-                crashlytics.log("Expected FILE_LIST_RESPONSE (D3) but got: " + String.format("%02X", responseId));
-
-                uiErrorAndRetry("Unexpected header, restarting after 1:00", 60, "unexpected_header", macAddress);
+            // --- STEP 2: Verify dock status on the active transfer socket ---
+            DockStatusSample[] dockStatusSamples = queryDockStatusSamples(in, out);
+            DockStatusSample lastDockStatus = dockStatusSamples[dockStatusSamples.length - 1];
+            if (!validateDockResponseTimestamps(dockStatusSamples)) {
+                Log.e(TAG, "Dock timestamp validation failed before file list request.");
+                uiErrorAndRetry("Device timestamps are not correct, please try again later.", 60, "dock_timestamp_invalid", macAddress);
                 return;
             }
-            int fileCount = in.read() & 0xFF;
+            if (lastDockStatus.dockState != 1) {
+                Log.w(TAG, "Shimmer is not docked before transfer. Last dockState=" + lastDockStatus.dockState);
+                uiErrorAndRetry("Shimmer is not docked. Restarting after 1:00", 60, "not_docked", macAddress);
+                return;
+            }
+            timestampModel = new DockingTimestampModel(
+                    lastDockStatus.deviceTimestamp,
+                    (int) (lastDockStatus.clientResponseMs / 1000L)
+            );
+            Log.d(TAG, "Using verified dock timestamp for header stamping: shimmerRtc=" +
+                    timestampModel.shimmerRtc + ", androidRtc=" + timestampModel.androidRtc);
+
+            // --- STEP 3: Request File Count ---
+            writePacketWithCrc(out, new byte[]{LIST_FILES_COMMAND}, TX_CRC_MODE, "LIST_FILES_COMMAND");
+            crashlytics.log("Sent LIST_FILES_COMMAND (D0)");
+
+            byte[] fileListPacket = readFixedPacket(in, FILE_LIST_RESPONSE, 2, RX_CRC_MODE, "FILE_LIST_RESPONSE");
+            int fileCount = fileListPacket[1] & 0xFF;
             Log.d(TAG, "FILE_LIST_RESPONSE: File count = " + fileCount);
             crashlytics.log("FILE_LIST_RESPONSE: File count = " + fileCount);
 
@@ -192,7 +217,7 @@ public class ShimmerFileTransferClient {
                 return;
             }
 
-            // --- STEP 3: Transfer Each File ---
+            // --- STEP 4: Transfer Each File ---
             // Before starting the file transfer loop
             Intent progressIntent = new Intent("com.example.myapplication.TRANSFER_PROGRESS");
             progressIntent.setPackage(context.getPackageName());
@@ -212,26 +237,15 @@ public class ShimmerFileTransferClient {
                 fileStartBundle.putInt("file_index", fileIndex);
                 firebaseAnalytics.logEvent("file_processing_started", fileStartBundle);
 
-                // Send TRANSFER_FILE_COMMAND
-                out.write(new byte[]{TRANSFER_FILE_COMMAND});
-                out.flush();
-                Log.d(TAG, "Sent TRANSFER_FILE_COMMAND (0xD1)");
+                // Send parameter-less TRANSFER_FILE_COMMAND for the next queued Shimmer file
+                writePacketWithCrc(out, new byte[]{TRANSFER_FILE_COMMAND}, TX_CRC_MODE, "TRANSFER_FILE_COMMAND");
 
                 // Wait for TRANSFER_START_PACKET
-                int startByte = in.read();
-                while (startByte == 0xFF) {
-                    startByte = in.read();
-                }
-                if (startByte != (TRANSFER_START_PACKET & 0xFF)) {
-                    Log.e(TAG, "Expected TRANSFER_START_PACKET (FD) but got: " + String.format("%02X", startByte));
-                    uiErrorAndRetry("Device disconnected or unexpected start. Restarting after 1:00", 60, "unexpected_start", macAddress);
-                    return; // abort this session; do NOT send TRANSFER_DONE
-                }
-
-                // Extract metadata
-                int protocolVersion = in.read();
-                int filenameLen = in.read();
-                byte[] filenameBytes = readExact(in, filenameLen);
+                byte[] startPacket = readTransferStartPacket(in);
+                int protocolVersion = startPacket[1] & 0xFF;
+                int filenameLen = startPacket[2] & 0xFF;
+                byte[] filenameBytes = new byte[filenameLen];
+                System.arraycopy(startPacket, 3, filenameBytes, 0, filenameLen);
                 String relativeFilename = new String(filenameBytes);
                 // Minimal tag extraction from filename
                 String experimentTag = null, shimmerIDTag = null;
@@ -244,14 +258,20 @@ public class ShimmerFileTransferClient {
                 if (experimentTag != null) tags.put("experiment", experimentTag);
                 if (shimmerIDTag != null) tags.put("shimmerID", shimmerIDTag);
                 Log.d(SYNC_TAG, "EXTRACTED TAGS FROM FILENAME: " + tags);
-                byte[] totalSizeBytes = readExact(in, 4);
+                int metadataOffset = 3 + filenameLen;
+                byte[] totalSizeBytes = new byte[]{
+                        startPacket[metadataOffset],
+                        startPacket[metadataOffset + 1],
+                        startPacket[metadataOffset + 2],
+                        startPacket[metadataOffset + 3]
+                };
                 int totalFileSize = ((totalSizeBytes[3] & 0xFF) << 24) |
                         ((totalSizeBytes[2] & 0xFF) << 16) |
                         ((totalSizeBytes[1] & 0xFF) << 8) |
                         (totalSizeBytes[0] & 0xFF);
-                byte[] chunkSizeBytes = readExact(in, 2);
+                byte[] chunkSizeBytes = new byte[]{startPacket[metadataOffset + 4], startPacket[metadataOffset + 5]};
                 int chunkSize = ((chunkSizeBytes[1] & 0xFF) << 8) | (chunkSizeBytes[0] & 0xFF);
-                byte[] totalChunksBytes = readExact(in, 2);
+                byte[] totalChunksBytes = new byte[]{startPacket[metadataOffset + 6], startPacket[metadataOffset + 7]};
                 int totalChunks = ((totalChunksBytes[1] & 0xFF) << 8) | (totalChunksBytes[0] & 0xFF);
 
                 Log.d(TAG, "TRANSFER_START_PACKET: version=" + protocolVersion
@@ -276,9 +296,7 @@ public class ShimmerFileTransferClient {
                 crashlytics.setCustomKey("total_chunks", totalChunks);
 
                 // Send READY_FOR_CHUNKS_COMMAND
-                out.write(new byte[]{READY_FOR_CHUNKS_COMMAND});
-                out.flush();
-                Log.d(TAG, "Sent READY_FOR_CHUNKS_COMMAND (0xD2)");
+                writePacketWithCrc(out, new byte[]{READY_FOR_CHUNKS_COMMAND}, TX_CRC_MODE, "READY_FOR_CHUNKS_COMMAND");
 
                 // Receive file chunks
                 // Get username and timestamp ONCE per file
@@ -320,138 +338,65 @@ public class ShimmerFileTransferClient {
                     Log.d(TAG, "Receiving chunks...");
 
                     int chunksProcessed = 0;
-                    byte[] firstChunkNumBytes = new byte[2]; // Store the first chunk number of the group
 
                     while (chunksProcessed < totalChunks) {
+                        int groupStartChunk = chunksProcessed;
                         int remainingChunks = totalChunks - chunksProcessed;
                         int chunksToRead = Math.min(CHUNK_GROUP_SIZE, remainingChunks);
+                        byte[][] groupDataBuffer = new byte[chunksToRead][];
 
                         // Log if this is the last chunk group
                         if (remainingChunks <= CHUNK_GROUP_SIZE) {
                             Log.d(TAG, "Processing the last chunk group. Remaining chunks: " + remainingChunks);
                         }
 
-                        boolean chunksAreValid = true; // Flag to track if chunks are valid
+                        boolean chunksAreValid = true; // Flag to track if the current group is valid
 
                         for (int i = 0; i < chunksToRead; i++) {
-                            int packetId = in.read();
-                            while (packetId == 0xFF) {
-                                packetId = in.read(); // Skip 0xFF
+                            ChunkPacket chunkPacket = readChunkPacket(in, chunkSize);
+                            int chunkSizeForThisChunk = chunkPacket.payload.length;
+
+                            Log.d(TAG, "Chunk received: chunkNum=" + chunkPacket.chunkNumber +
+                                    ", expected=" + (groupStartChunk + i) +
+                                    ", groupStart=" + groupStartChunk +
+                                    ", chunkSize=" + chunkSizeForThisChunk +
+                                    ", crcOk=" + chunkPacket.crcOk);
+
+                            if (!chunkPacket.crcOk || chunkPacket.chunkNumber != groupStartChunk + i) {
+                                chunksAreValid = false;
+                                Log.w(TAG, "Invalid chunk in group. chunkNum=" + chunkPacket.chunkNumber +
+                                        ", expected=" + (groupStartChunk + i) +
+                                        ", crcOk=" + chunkPacket.crcOk +
+                                        ". Group will be NACKed from " + groupStartChunk);
+                            } else {
+                                groupDataBuffer[i] = chunkPacket.payload;
                             }
-
-                            if (packetId != (CHUNK_DATA_PACKET & 0xFF)) {
-                                Log.w(TAG, "Unexpected header packet received: " + String.format("%02X", packetId));
-                                // Try to read and log all available bytes (up to 32) for debugging
-                                try {
-                                    int available = in.available();
-                                    if (available > 0) {
-                                        int toRead = Math.min(available, 32);
-                                        byte[] debugBytes = new byte[toRead];
-                                        int bytesRead = in.read(debugBytes);
-                                        if (bytesRead > 0) {
-                                            StringBuilder debugData = new StringBuilder("Next available bytes after unexpected header: ");
-                                            for (int j = 0; j < bytesRead; j++) {
-                                                debugData.append(String.format("%02X ", debugBytes[j]));
-                                            }
-                                            Log.w("DockingTransferError", debugData.toString().trim());
-                                        }
-                                    } else {
-                                        Log.w("DockingTransferError", "No additional bytes available after unexpected header.");
-                                    }
-                                } catch (Exception e) {
-                                    Log.e("DockingTransferError", "Error reading bytes after unexpected header: " + e.getMessage(), e);
-                                }
-                                // Delete incomplete file and DB entry
-                                if (outputFile.exists()) outputFile.delete();
-                                FileMetaDatabaseHelper dbHelper = new FileMetaDatabaseHelper(context);
-                                SQLiteDatabase db = dbHelper.getWritableDatabase();
-                                db.delete("files", "FILE_PATH=?", new String[]{outputFile.getAbsolutePath()});
-                                db.close();
-
-                                uiErrorAndRetry("Unexpected header, restarting after 1:00", 60, "unexpected_header", macAddress);
-                                return;
-                            }
-
-                            byte[] chunkNumBytes = readExact(in, 2);
-                           
-
-                            byte[] totalBytes = readExact(in, 2);
-                            int chunkSizeForThisChunk = ((totalBytes[1] & 0xFF) << 8) | (totalBytes[0] & 0xFF);
-                            byte[] chunkData = readExact(in, chunkSizeForThisChunk);
-
-                            Log.d(TAG, "Chunk number (raw bytes): " + String.format("%02X %02X", chunkNumBytes[0], chunkNumBytes[1])+
-                                   ", Total bytes (raw bytes): " + String.format("%02X %02X", totalBytes[0], totalBytes[1]) +
-                                   ", Chunk size: " + chunkSizeForThisChunk);
-
-                            // Write raw binary data to the output file
-                            binaryWriter.write(chunkData);
 
                             // Write raw hexadecimal data to the debug file with header
                             StringBuilder hexLine = new StringBuilder();
-                            hexLine.append(String.format("%02X ", packetId)); // Add header (starting with FC)
-                            hexLine.append(String.format("%02X %02X ", chunkNumBytes[0], chunkNumBytes[1])); // Add chunk number
-                            hexLine.append(String.format("%02X %02X ", totalBytes[0], totalBytes[1])); // Add total bytes
-                            for (byte b : chunkData) {
+                            hexLine.append(String.format("%02X ", CHUNK_DATA_PACKET)); // Add header (starting with FC)
+                            hexLine.append(String.format("%02X %02X ", chunkPacket.chunkNumLsb, chunkPacket.chunkNumMsb)); // Add chunk number
+                            hexLine.append(String.format("%02X %02X ", chunkPacket.payloadSizeLsb, chunkPacket.payloadSizeMsb)); // Add total bytes
+                            for (byte b : chunkPacket.payload) {
                                 hexLine.append(String.format("%02X ", b)); // Add chunk data
                             }
                             debugWriter.write(hexLine.toString().trim() + "\n");
-
-                            if (i == 0) {
-                                firstChunkNumBytes[0] = chunkNumBytes[0]; // LSB
-                                firstChunkNumBytes[1] = chunkNumBytes[1]; // MSB
-                            }
-
-                            chunksProcessed++;
                             
                         }
 
-                        // Send ACK or NACK based on validity
-                        byte ackStatusToSend = chunksAreValid ? (byte) 0x01 : (byte) 0x00;
-
-                        byte[] ackPacket = new byte[]{
-                                chunksAreValid ? CHUNK_DATA_ACK : CHUNK_DATA_NACK, // Send ACK or NACK
-                                firstChunkNumBytes[0],
-                                firstChunkNumBytes[1],
-                                ackStatusToSend
-                        };
-
-                        // --- ACK Retry Protocol ---
-                       int retryCount = 0;
-                    boolean gotResponse = false;
-                    while (retryCount < 2 && !gotResponse) {
-                        out.write(ackPacket);
-                        out.flush();
-                        Log.d(TAG,  " Sent " + (chunksAreValid ? "ACK" : "NACK") + " packet (retry " + retryCount + "): " +
-                                String.format("%02X %02X %02X %02X", ackPacket[0], ackPacket[1], ackPacket[2], ackPacket[3]));
-
-                        // Wait for response with timeout
-                        long startTime = System.currentTimeMillis();
-                        while (System.currentTimeMillis() - startTime < 10000) { // 10 seconds
-                            if (in.available() > 0) {
-                                gotResponse = true;
-                                break;
+                        if (chunksAreValid) {
+                            for (int i = 0; i < chunksToRead; i++) {
+                                binaryWriter.write(groupDataBuffer[i]);
                             }
-                            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+                            binaryWriter.flush();
+                            chunksProcessed += chunksToRead;
                         }
-                        if (!gotResponse) {
-                            retryCount++;
-                            Log.w(TAG, " No response after ACK, resending ACK (attempt " + (retryCount+1) + ")");
-                        }
-                    }
-                    
-                    if (!gotResponse) {
-                            Log.e(TAG, "No response after 2 ACK retries. Scheduling transfer restart in 1 minute.");
-                            // Delete incomplete file and DB entry
-                            if (outputFile.exists()) outputFile.delete();
-                            FileMetaDatabaseHelper dbHelper = new FileMetaDatabaseHelper(context);
-                            SQLiteDatabase db = dbHelper.getWritableDatabase();
-                            db.delete("files", "FILE_PATH=?", new String[]{outputFile.getAbsolutePath()});
-                            db.close();
 
-                            uiErrorAndRetry("No response from sensor, restarting after 1:00", 60, "ack_timeout", macAddress);
-                            return; // Exit the transfer method
-                        }
-                        // --- END OF ACK Retry Protocol ---
+                        sendGroupAck(out, groupStartChunk, chunksAreValid);
+                        Log.d(TAG, "Sent GROUP " + (chunksAreValid ? "ACK" : "NACK") +
+                                " for groupStart=" + groupStartChunk +
+                                ", chunksInGroup=" + chunksToRead +
+                                ", chunksProcessed=" + chunksProcessed + "/" + totalChunks);
 
                         // Log progress to Firebase
                         Bundle progressBundle = new Bundle();
@@ -460,35 +405,20 @@ public class ShimmerFileTransferClient {
                         progressBundle.putInt("total_chunks", totalChunks);
                         firebaseAnalytics.logEvent("file_transfer_progress", progressBundle);
 
-                        // Restart transfer if chunks are invalid
                         if (!chunksAreValid) {
-                            Log.e(TAG, "Chunks are invalid. Entering silent state and broadcasting failure...");
-                            broadcastFailure("chunks_invalid");
-                            return;
+                            Log.w(TAG, "Group NACK sent. Waiting for Shimmer to retransmit group starting at " + groupStartChunk);
                         }
                     }
                     if (chunksProcessed >= totalChunks) {
-                        Log.d(TAG, "Last chunk group processed. Skipping bytes until TRANSFER_END_PACKET with valid status...");
-                        int packetId;
-                        int transferStatus = -1;
-                        while (true) {
-                            packetId = in.read();
-                            if (packetId == (TRANSFER_END_PACKET & 0xFF)) {
-                                transferStatus = in.read();
-                                Log.d(TAG, "Received TRANSFER_END_PACKET with status: " + String.format("%02X", transferStatus));
-                                if (transferStatus == 0x01) {
-                                    transferSuccess = true; // <-- Mark as success
-                                    break;
-                                } 
-                                else if (transferStatus == 0x00) {
-                                    transferSuccess = false;
-                                    break;
-                                }
-                                else {
-                                    transferSuccess = false;
-                                    Log.d(TAG, "Status after FE was not 00 or 01, continuing to skip...");
-                                }
-                            }
+                        Log.d(TAG, "Last chunk group processed. Waiting for CRC-valid TRANSFER_END_PACKET...");
+                        byte[] transferEndPacket = readFixedPacket(in, TRANSFER_END_PACKET, 2, RX_CRC_MODE, "TRANSFER_END_PACKET");
+                        int transferStatus = transferEndPacket[1] & 0xFF;
+                        Log.d(TAG, "Received TRANSFER_END_PACKET with status: " + String.format("%02X", transferStatus));
+                        if (transferStatus == (TRANSFER_STATUS_SUCCESS & 0xFF)) {
+                            transferSuccess = true;
+                        } else {
+                            transferSuccess = false;
+                            Log.w(TAG, "Transfer end reported failure status: " + String.format("0x%02X", transferStatus));
                         }
                     }
                 } catch (IOException e) {
@@ -623,6 +553,272 @@ public class ShimmerFileTransferClient {
             totalRead += read;
         }
         return buffer;
+    }
+
+    private DockStatusSample[] queryDockStatusSamples(InputStream in, OutputStream out) throws IOException, InterruptedException {
+        DockStatusSample[] samples = new DockStatusSample[NUM_DOCK_STATUS_QUERIES];
+        Log.d(TAG, "Checking Shimmer dock status " + NUM_DOCK_STATUS_QUERIES + " times before file list request.");
+        for (int i = 0; i < NUM_DOCK_STATUS_QUERIES; i++) {
+            long requestAtMs = System.currentTimeMillis();
+            Log.d(TAG, "Sending CHECK_DOCK_STATUS query " + (i + 1) + "/" + NUM_DOCK_STATUS_QUERIES);
+            writePacketWithCrc(out, new byte[]{CHECK_DOCK_STATUS}, TX_CRC_MODE, "CHECK_DOCK_STATUS");
+
+            byte[] response = readFixedPacket(in, RESPONSE_DOCK_STATE, 10, RX_CRC_MODE, "RESPONSE_DOCK_STATE");
+            long responseAtMs = System.currentTimeMillis();
+            int dockState = response[1] & 0xFF;
+            long deviceTimestamp = leUint64(response, 2);
+            double roundTripS = (responseAtMs - requestAtMs) / 1000.0;
+            samples[i] = new DockStatusSample(dockState, deviceTimestamp, responseAtMs, roundTripS);
+            Log.d(TAG, "Dock status query " + (i + 1) + "/" + NUM_DOCK_STATUS_QUERIES +
+                    ": dockState=" + dockState +
+                    ", deviceTimestamp=" + deviceTimestamp +
+                    ", roundTripS=" + String.format(java.util.Locale.US, "%.3f", roundTripS));
+
+            if (i < NUM_DOCK_STATUS_QUERIES - 1) {
+                Thread.sleep(3000);
+            }
+        }
+        return samples;
+    }
+
+    private boolean validateDockResponseTimestamps(DockStatusSample[] samples) {
+        if (samples == null || samples.length < 3) {
+            Log.e(TAG, "Dock timestamp validation requires at least 3 samples.");
+            return false;
+        }
+
+        boolean pass = true;
+        for (int i = 0; i < 2; i++) {
+            double localDeltaS = (samples[i + 1].clientResponseMs - samples[i].clientResponseMs) / 1000.0;
+            double deviceDeltaS = (samples[i + 1].deviceTimestamp - samples[i].deviceTimestamp) / (double) DEVICE_CLOCK_RATE_HZ;
+            double errorS = Math.abs(localDeltaS - deviceDeltaS);
+            boolean pairPass = errorS <= DOCK_TIMESTAMP_TOLERANCE_S;
+            Log.d(TAG, "Dock timestamp pair " + (i + 1) + "->" + (i + 2) +
+                    ": localDeltaS=" + String.format(java.util.Locale.US, "%.3f", localDeltaS) +
+                    ", deviceDeltaS=" + String.format(java.util.Locale.US, "%.3f", deviceDeltaS) +
+                    ", errorS=" + String.format(java.util.Locale.US, "%.3f", errorS) +
+                    ", pass=" + pairPass);
+            pass = pass && pairPass;
+        }
+        Log.d(TAG, "Dock timestamp validation result: " + (pass ? "PASS" : "FAIL"));
+        return pass;
+    }
+
+    private byte[] readFixedPacket(InputStream in, byte expectedId, int payloadLen, int crcMode, String label) throws IOException {
+        int packetId = readProtocolByte(in);
+        if (packetId != (expectedId & 0xFF)) {
+            throw new IOException(label + " expected " + hex(expectedId) + " but got " + String.format("0x%02X", packetId));
+        }
+
+        byte[] payload = new byte[payloadLen];
+        payload[0] = (byte) packetId;
+        if (payloadLen > 1) {
+            byte[] rest = readExact(in, payloadLen - 1);
+            System.arraycopy(rest, 0, payload, 1, rest.length);
+        }
+
+        byte[] crcBytes = readExact(in, crcNumBytes(crcMode));
+        if (!checkCrc(crcMode, payload, crcBytes)) {
+            Log.e(TAG, label + " CRC failed. payload=" + bytesToHex(payload) + ", crc=" + bytesToHex(crcBytes));
+            throw new IOException(label + " CRC validation failed");
+        }
+
+        Log.d(TAG, label + " received with CRC OK. payloadLen=" + payloadLen + ", crcMode=" + crcMode);
+        return payload;
+    }
+
+    private byte[] readTransferStartPacket(InputStream in) throws IOException {
+        int packetId = readProtocolByte(in);
+        if (packetId != (TRANSFER_START_PACKET & 0xFF)) {
+            throw new IOException("TRANSFER_START_PACKET expected " + hex(TRANSFER_START_PACKET) + " but got " + String.format("0x%02X", packetId));
+        }
+
+        byte[] header = readExact(in, 2);
+        int version = header[0] & 0xFF;
+        int nameLen = header[1] & 0xFF;
+        if (nameLen == 0 || nameLen >= MAX_FILENAME_LENGTH) {
+            throw new IOException("Invalid filename length in TRANSFER_START_PACKET: " + nameLen);
+        }
+
+        int payloadLen = 1 + 1 + 1 + nameLen + 4 + 2 + 2;
+        byte[] payload = new byte[payloadLen];
+        payload[0] = TRANSFER_START_PACKET;
+        payload[1] = header[0];
+        payload[2] = header[1];
+        byte[] rest = readExact(in, nameLen + 4 + 2 + 2);
+        System.arraycopy(rest, 0, payload, 3, rest.length);
+
+        byte[] crcBytes = readExact(in, crcNumBytes(RX_CRC_MODE));
+        if (!checkCrc(RX_CRC_MODE, payload, crcBytes)) {
+            Log.e(TAG, "TRANSFER_START_PACKET CRC failed. payload=" + bytesToHex(payload) + ", crc=" + bytesToHex(crcBytes));
+            throw new IOException("TRANSFER_START_PACKET CRC validation failed");
+        }
+        if (version != (FILE_TRANSFER_VERSION & 0xFF)) {
+            throw new IOException("Unsupported file transfer version: " + version);
+        }
+
+        Log.d(TAG, "TRANSFER_START_PACKET received with CRC OK. nameLen=" + nameLen + ", version=" + version);
+        return payload;
+    }
+
+    private ChunkPacket readChunkPacket(InputStream in, int maxChunkSize) throws IOException {
+        int packetId = readProtocolByte(in);
+        if (packetId != (CHUNK_DATA_PACKET & 0xFF)) {
+            throw new IOException("CHUNK_DATA_PACKET expected " + hex(CHUNK_DATA_PACKET) + " but got " + String.format("0x%02X", packetId));
+        }
+
+        byte[] header = readExact(in, 4);
+        int chunkNumber = ((header[1] & 0xFF) << 8) | (header[0] & 0xFF);
+        int payloadSize = ((header[3] & 0xFF) << 8) | (header[2] & 0xFF);
+        if (maxChunkSize > 0 && payloadSize > maxChunkSize) {
+            throw new IOException("Invalid chunk payload size " + payloadSize + ", max expected " + maxChunkSize);
+        }
+
+        byte[] chunkData = readExact(in, payloadSize);
+        byte[] payload = new byte[1 + header.length + chunkData.length];
+        payload[0] = CHUNK_DATA_PACKET;
+        System.arraycopy(header, 0, payload, 1, header.length);
+        System.arraycopy(chunkData, 0, payload, 1 + header.length, chunkData.length);
+        byte[] crcBytes = readExact(in, crcNumBytes(DATA_CHUNK_CRC_MODE));
+        boolean crcOk = checkCrc(DATA_CHUNK_CRC_MODE, payload, crcBytes);
+        if (!crcOk) {
+            Log.w(TAG, "CHUNK_DATA_PACKET CRC failed for chunk " + chunkNumber +
+                    ". payloadLen=" + payload.length + ", crc=" + bytesToHex(crcBytes));
+        }
+
+        return new ChunkPacket(chunkNumber, header[0], header[1], header[2], header[3], chunkData, crcOk);
+    }
+
+    private int readProtocolByte(InputStream in) throws IOException {
+        int packetId;
+        do {
+            packetId = in.read();
+            if (packetId == -1) {
+                throw new EOFException("Stream ended before protocol packet ID");
+            }
+        } while (packetId == 0xFF || packetId == 0x00);
+        return packetId;
+    }
+
+    private void writePacketWithCrc(OutputStream out, byte[] packet, int crcMode, String label) throws IOException {
+        byte[] packetWithCrc = appendCrc(packet, crcMode);
+        out.write(packetWithCrc);
+        out.flush();
+        Log.d(TAG, "Sent " + label + " " + bytesToHex(packetWithCrc) + " (crcMode=" + crcMode + ")");
+    }
+
+    private void sendGroupAck(OutputStream out, int groupStartChunk, boolean success) throws IOException {
+        byte[] ackPacket = new byte[]{
+                CHUNK_DATA_ACK,
+                (byte) (groupStartChunk & 0xFF),
+                (byte) ((groupStartChunk >> 8) & 0xFF),
+                success ? ACK_SUCCESS : ACK_FAIL
+        };
+        writePacketWithCrc(out, ackPacket, TX_CRC_MODE, success ? "GROUP_ACK" : "GROUP_NACK");
+    }
+
+    private byte[] appendCrc(byte[] payload, int crcMode) {
+        int crcBytes = crcNumBytes(crcMode);
+        byte[] packet = new byte[payload.length + crcBytes];
+        System.arraycopy(payload, 0, packet, 0, payload.length);
+        if (crcBytes == 0) return packet;
+
+        int crc = crcData(payload, payload.length);
+        packet[payload.length] = (byte) (crc & 0xFF);
+        if (crcBytes == 2) {
+            packet[payload.length + 1] = (byte) ((crc >> 8) & 0xFF);
+        }
+        return packet;
+    }
+
+    private boolean checkCrc(int crcMode, byte[] payload, byte[] crcBytes) {
+        int expectedBytes = crcNumBytes(crcMode);
+        if (expectedBytes == 0) return true;
+        if (crcBytes == null || crcBytes.length < expectedBytes) return false;
+
+        int crc = crcData(payload, payload.length);
+        if ((byte) (crc & 0xFF) != crcBytes[0]) return false;
+        return expectedBytes != 2 || (byte) ((crc >> 8) & 0xFF) == crcBytes[1];
+    }
+
+    private int crcData(byte[] buffer, int len) {
+        int crc = CRC_INIT & 0xFFFF;
+        int paddedLen = (len % 2 == 0) ? len : len + 1;
+        for (int i = 0; i < paddedLen; i++) {
+            int value = i < len ? (buffer[i] & 0xFF) : 0;
+            crc ^= (value << 8);
+            for (int bit = 0; bit < 8; bit++) {
+                if ((crc & 0x8000) != 0) {
+                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+                } else {
+                    crc = (crc << 1) & 0xFFFF;
+                }
+            }
+        }
+        return crc & 0xFFFF;
+    }
+
+    private int crcNumBytes(int crcMode) {
+        if (crcMode == CRC_OFF) return 0;
+        if (crcMode == CRC_1BYTE_ENABLED) return 1;
+        if (crcMode == CRC_2BYTES_ENABLED) return 2;
+        throw new IllegalArgumentException("Unsupported CRC mode: " + crcMode);
+    }
+
+    private long leUint64(byte[] bytes, int offset) {
+        long value = 0L;
+        for (int i = 7; i >= 0; i--) {
+            value = (value << 8) | (bytes[offset + i] & 0xFFL);
+        }
+        return value;
+    }
+
+    private String hex(byte value) {
+        return String.format("0x%02X", value);
+    }
+
+    private String bytesToHex(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(String.format("%02X", b));
+        }
+        return sb.toString();
+    }
+
+    private static class DockStatusSample {
+        final int dockState;
+        final long deviceTimestamp;
+        final long clientResponseMs;
+        final double roundTripS;
+
+        DockStatusSample(int dockState, long deviceTimestamp, long clientResponseMs, double roundTripS) {
+            this.dockState = dockState;
+            this.deviceTimestamp = deviceTimestamp;
+            this.clientResponseMs = clientResponseMs;
+            this.roundTripS = roundTripS;
+        }
+    }
+
+    private static class ChunkPacket {
+        final int chunkNumber;
+        final byte chunkNumLsb;
+        final byte chunkNumMsb;
+        final byte payloadSizeLsb;
+        final byte payloadSizeMsb;
+        final byte[] payload;
+        final boolean crcOk;
+
+        ChunkPacket(int chunkNumber, byte chunkNumLsb, byte chunkNumMsb, byte payloadSizeLsb, byte payloadSizeMsb, byte[] payload, boolean crcOk) {
+            this.chunkNumber = chunkNumber;
+            this.chunkNumLsb = chunkNumLsb;
+            this.chunkNumMsb = chunkNumMsb;
+            this.payloadSizeLsb = payloadSizeLsb;
+            this.payloadSizeMsb = payloadSizeMsb;
+            this.payload = payload;
+            this.crcOk = crcOk;
+        }
     }
 
     // Overloaded transfer method with timestamp

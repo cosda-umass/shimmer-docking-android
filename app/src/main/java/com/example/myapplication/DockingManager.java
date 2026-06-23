@@ -39,8 +39,15 @@ public class DockingManager {
         void onAmbiguous();
         void onFileTransferStart();
     }
-
+//ShimmerTransfer
     private static final String TAG = "DockingManager";
+    private static final byte CHECK_DOCK_STATUS = (byte) 0xD5;
+    private static final byte RESPONSE_DOCK_STATE = (byte) 0xD6;
+    private static final int NUM_DOCK_STATUS_QUERIES = 3;
+    private static final int DEVICE_CLOCK_RATE_HZ = 32768;
+    private static final double DOCK_TIMESTAMP_TOLERANCE_S = 1.0;
+    private static final int CRC_INIT = 0xB0CA;
+    private static final int RX_CRC_MODE = 2;
     private final Context context;
     private final Handler handler = new Handler();
     private PowerManager.WakeLock wakeLock;
@@ -523,16 +530,13 @@ private void processShimmerQueue() {
 
     // State 5: Direct Query and Connection
     private void startDirectQueryAndConnection() {
-        Log.d(TAG, "Direct query and connection...");
+        Log.d(TAG, "Monitoring complete; transfer client will run MATLAB dock validation before file list.");
         // If Bluetooth is OFF, do not proceed; go silent and inform UI
         if (adapter == null || !adapter.isEnabled()) {
-            handleBluetoothOffAndSilent("direct query start");
+            handleBluetoothOffAndSilent("transfer handoff start");
             return;
         }
-        new Thread(() -> {
-            int dockStatus = queryDockStateFromShimmer(shimmerMac);
-            handler.post(() -> handleDockStateResponse(dockStatus));
-        }).start();
+        handleDockStateResponse(1);
     }
 
     // State 6: Response Handling
@@ -680,69 +684,46 @@ private void processShimmerQueue() {
             }
             Log.d(TAG, "Connected to Shimmer: " + macAddress);
 
-            // Send CHECK_DOCK_STATE (0xD5)
             OutputStream out = socket.getOutputStream();
-            out.write(new byte[]{(byte) 0xD5});
-            out.flush();
-            Log.d(TAG, "Sent CHECK_DOCK_STATE (0xD5)");
+            InputStream in = socket.getInputStream();
 
-            // Increase wait time before reading response
-            try {
-                Thread.sleep(500);
-            } catch (InterruptedException ie) {
-                Log.e(TAG, "Sleep interrupted before reading response", ie);
+            DockStatusResult[] dockResults = new DockStatusResult[NUM_DOCK_STATUS_QUERIES];
+            for (int queryIdx = 0; queryIdx < NUM_DOCK_STATUS_QUERIES; queryIdx++) {
+                long requestAtMs = System.currentTimeMillis();
+                out.write(new byte[]{CHECK_DOCK_STATUS});
+                out.flush();
+                Log.d(TAG, "Sent CHECK_DOCK_STATUS query " + (queryIdx + 1) + "/" + NUM_DOCK_STATUS_QUERIES + " (0xD5)");
+
+                byte[] responsePacket = readDockStatusPacket(in);
+                long responseAtMs = System.currentTimeMillis();
+                int statusByte = responsePacket[1] & 0xFF;
+                long shimmerRtc = readLeUint64(responsePacket, 2);
+                double roundTripS = (responseAtMs - requestAtMs) / 1000.0;
+                dockResults[queryIdx] = new DockStatusResult(statusByte, shimmerRtc, responseAtMs);
+                Log.d(TAG, "[DockQuery] query=" + (queryIdx + 1) +
+                        ", dockState=" + statusByte +
+                        ", shimmerRtc64=" + shimmerRtc +
+                        ", roundTripS=" + String.format(java.util.Locale.US, "%.3f", roundTripS));
+
+                if (queryIdx < NUM_DOCK_STATUS_QUERIES - 1) {
+                    try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+                }
             }
 
-            // Read RESPONSE_DOCK_STATE (0xD6) and status byte, skipping all 0xFF
-            InputStream in = socket.getInputStream();
-            int firstByte;
-            do {
-                firstByte = in.read();
-                if (firstByte == -1) {
-                    Log.e(TAG, "Stream ended before receiving response");
-                    // Track failure in retries map
-                    int currentRetries = silentRetryCounts.getOrDefault(macAddress, 0);
-                    silentRetryCounts.put(macAddress, currentRetries + 1);
-                    Log.d(TAG, "[RTC-STORE] Stream ended, shimmerRtc64 NOT stored for MAC " + macAddress);
-                    return 0;
-                }
-            } while (firstByte == 0xFF);
-
-            if (firstByte == 0xD6) {
-                int statusByte = in.read();
-                if (statusByte == -1) {
-                    Log.e(TAG, "Stream ended before receiving status byte");
-                    Log.d(TAG, "[RTC-STORE] Status byte missing, shimmerRtc64 NOT stored for MAC " + macAddress);
-                    return 0;
-                }
-                // Read shimmer RTC64 (8 bytes)
-                byte[] rtcBytes = new byte[8];
-                int rtcRead = in.read(rtcBytes);
-                long shimmerRtc = 0L;
-                if (rtcRead == 8) {
-                    // Correctly interpret as little-endian
-                    for (int i = 7; i >= 0; i--) {
-                        shimmerRtc = (shimmerRtc << 8) | (rtcBytes[i] & 0xFF);
-                    }
-                }else {
-                    Log.e(TAG, "Failed to read shimmer RTC64, got " + rtcRead + " bytes");
-                    Log.d(TAG, "[RTC-STORE] RTC64 read failed, shimmerRtc64 NOT stored for MAC " + macAddress);
-                }
-                Log.d(TAG, "Received dock status from Shimmer: " + statusByte + ", shimmerRtc64=" + shimmerRtc);
-                // Store shimmerRtc for later use (if docked)
-                if (statusByte == 1) {
-                    // Save shimmerRtc in a field for use in timestamp model
-                    lastDockedShimmerRtc = shimmerRtc;
-                    Log.d(TAG, "[RTC-STORE] shimmerRtc64 STORED for MAC " + macAddress + ": " + shimmerRtc);
-                } else {
-                    Log.d(TAG, "[RTC-STORE] shimmerRtc64 NOT stored (undocked) for MAC " + macAddress);
-                }
-                return statusByte; // 0 = Undocked, 1 = Docked
-            } else {
-                Log.e(TAG, String.format("Unexpected non-FF, non-D6 byte from Shimmer: 0x%02X (%d)", firstByte, firstByte));
-                Log.d(TAG, "[RTC-STORE] Unexpected response, shimmerRtc64 NOT stored for MAC " + macAddress);
+            if (!validateDockStatusTimestamps(dockResults)) {
+                Log.e(TAG, "[RTC-STORE] Dock timestamp validation failed for MAC " + macAddress);
                 return 0;
             }
+
+            DockStatusResult lastResult = dockResults[NUM_DOCK_STATUS_QUERIES - 1];
+            Log.d(TAG, "Received dock status from Shimmer: " + lastResult.dockState + ", shimmerRtc64=" + lastResult.deviceTimestamp);
+            if (lastResult.dockState == 1) {
+                lastDockedShimmerRtc = lastResult.deviceTimestamp;
+                Log.d(TAG, "[RTC-STORE] shimmerRtc64 STORED for MAC " + macAddress + ": " + lastResult.deviceTimestamp);
+            } else {
+                Log.d(TAG, "[RTC-STORE] shimmerRtc64 NOT stored (undocked) for MAC " + macAddress);
+            }
+            return lastResult.dockState;
         } catch (SecurityException se) {
             Log.e(TAG, "Bluetooth connect failed due to missing permission", se);
             Log.d(TAG, "[RTC-STORE] shimmerRtc64 NOT stored due to permission error for MAC " + macAddress);
@@ -759,6 +740,122 @@ private void processShimmerQueue() {
                     Log.e(TAG, "Error closing Bluetooth socket", ignored);
                 }
             }
+        }
+    }
+
+    private byte[] readDockStatusPacket(InputStream in) throws IOException {
+        int firstByte;
+        do {
+            firstByte = in.read();
+            if (firstByte == -1) {
+                throw new IOException("Stream ended before receiving dock status response");
+            }
+        } while (firstByte == 0xFF || firstByte == 0x00);
+
+        if (firstByte != (RESPONSE_DOCK_STATE & 0xFF)) {
+            throw new IOException(String.format("Expected RESPONSE_DOCK_STATE 0xD6 but got 0x%02X", firstByte));
+        }
+
+        byte[] payload = new byte[10];
+        payload[0] = RESPONSE_DOCK_STATE;
+        readExact(in, payload, 1, 9);
+        byte[] crc = new byte[crcNumBytes(RX_CRC_MODE)];
+        readExact(in, crc, 0, crc.length);
+        if (!checkCrc(payload, crc)) {
+            Log.e(TAG, "[DockQuery] RESPONSE_DOCK_STATE CRC failed. payload=" + bytesToHex(payload) + ", crc=" + bytesToHex(crc));
+            throw new IOException("Dock status CRC validation failed");
+        }
+        Log.d(TAG, "[DockQuery] RESPONSE_DOCK_STATE CRC OK");
+        return payload;
+    }
+
+    private void readExact(InputStream in, byte[] buffer, int offset, int len) throws IOException {
+        int totalRead = 0;
+        while (totalRead < len) {
+            int read = in.read(buffer, offset + totalRead, len - totalRead);
+            if (read == -1) {
+                throw new IOException("Stream ended while reading " + len + " bytes; got " + totalRead);
+            }
+            totalRead += read;
+        }
+    }
+
+    private boolean validateDockStatusTimestamps(DockStatusResult[] results) {
+        if (results == null || results.length < 3) return false;
+        boolean pass = true;
+        for (int i = 0; i < 2; i++) {
+            double localDeltaS = (results[i + 1].clientResponseMs - results[i].clientResponseMs) / 1000.0;
+            double deviceDeltaS = (results[i + 1].deviceTimestamp - results[i].deviceTimestamp) / (double) DEVICE_CLOCK_RATE_HZ;
+            double errorS = Math.abs(localDeltaS - deviceDeltaS);
+            boolean pairPass = errorS <= DOCK_TIMESTAMP_TOLERANCE_S;
+            Log.d(TAG, "[DockQuery] timestamp pair " + (i + 1) + "->" + (i + 2) +
+                    ": localDeltaS=" + String.format(java.util.Locale.US, "%.3f", localDeltaS) +
+                    ", deviceDeltaS=" + String.format(java.util.Locale.US, "%.3f", deviceDeltaS) +
+                    ", errorS=" + String.format(java.util.Locale.US, "%.3f", errorS) +
+                    ", pass=" + pairPass);
+            pass = pass && pairPass;
+        }
+        Log.d(TAG, "[DockQuery] timestamp validation result: " + (pass ? "PASS" : "FAIL"));
+        return pass;
+    }
+
+    private boolean checkCrc(byte[] payload, byte[] crcBytes) {
+        int crc = crcData(payload, payload.length);
+        if (crcBytes == null || crcBytes.length < 2) return false;
+        return (byte) (crc & 0xFF) == crcBytes[0] && (byte) ((crc >> 8) & 0xFF) == crcBytes[1];
+    }
+
+    private int crcData(byte[] buffer, int len) {
+        int crc = CRC_INIT & 0xFFFF;
+        int paddedLen = (len % 2 == 0) ? len : len + 1;
+        for (int i = 0; i < paddedLen; i++) {
+            int value = i < len ? (buffer[i] & 0xFF) : 0;
+            crc ^= (value << 8);
+            for (int bit = 0; bit < 8; bit++) {
+                if ((crc & 0x8000) != 0) {
+                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+                } else {
+                    crc = (crc << 1) & 0xFFFF;
+                }
+            }
+        }
+        return crc & 0xFFFF;
+    }
+
+    private int crcNumBytes(int crcMode) {
+        if (crcMode == 0) return 0;
+        if (crcMode == 1) return 1;
+        if (crcMode == 2) return 2;
+        throw new IllegalArgumentException("Unsupported CRC mode: " + crcMode);
+    }
+
+    private long readLeUint64(byte[] bytes, int offset) {
+        long value = 0L;
+        for (int i = 7; i >= 0; i--) {
+            value = (value << 8) | (bytes[offset + i] & 0xFFL);
+        }
+        return value;
+    }
+
+    private String bytesToHex(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(String.format("%02X", b));
+        }
+        return sb.toString();
+    }
+
+    private static class DockStatusResult {
+        final int dockState;
+        final long deviceTimestamp;
+        final long clientResponseMs;
+
+        DockStatusResult(int dockState, long deviceTimestamp, long clientResponseMs) {
+            this.dockState = dockState;
+            this.deviceTimestamp = deviceTimestamp;
+            this.clientResponseMs = clientResponseMs;
         }
     }
 
@@ -835,10 +932,10 @@ private void processShimmerQueue() {
         if (!isMonitoring) return;
         long elapsed = System.currentTimeMillis() - monitoringStartTime;
         if (elapsed >= monitoringPhaseDurationMs) {
-            // Monitoring phase complete, proceed to dock/transfer/sync
+            // Monitoring phase complete. The transfer client performs the MATLAB
+            // 3-query dock validation immediately before LIST_FILES_COMMAND.
             isMonitoring = false;
-            int dockStatus = queryDockStateFromShimmer(mac);
-            handleDockStateResponseRoundRobin(dockStatus, mac, onComplete);
+            handleDockStateResponseRoundRobin(1, mac, onComplete);
             return;
         }
 
